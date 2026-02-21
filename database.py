@@ -1,7 +1,7 @@
 import sqlite3
 import logging
 from contextlib import contextmanager
-from typing import Optional, List, Tuple, Any
+from typing import Optional, List, Tuple
 
 DB_PATH = "school.db"
 log = logging.getLogger(__name__)
@@ -46,9 +46,13 @@ def init_db():
                 email           TEXT    NOT NULL,
                 tariff          TEXT    NOT NULL,
                 lessons_balance INTEGER NOT NULL DEFAULT 0,
-                status          TEXT    NOT NULL DEFAULT 'active'
+                status          TEXT    NOT NULL DEFAULT 'active',
+                timezone        TEXT    NOT NULL DEFAULT 'Europe/Paris'
             )
         """)
+        stu_cols = _table_columns(c, "students")
+        if "timezone" not in stu_cols:
+            c.execute("ALTER TABLE students ADD COLUMN timezone TEXT NOT NULL DEFAULT 'Europe/Paris'")
 
         # -- schedule ---------------------------------------------------------
         c.execute("""
@@ -59,9 +63,16 @@ def init_db():
                 time        TEXT    NOT NULL,
                 zoom_link   TEXT    NOT NULL DEFAULT '',
                 student_id  INTEGER DEFAULT NULL
-                    REFERENCES students(id) ON DELETE SET NULL
+                    REFERENCES students(id) ON DELETE SET NULL,
+                reminded_24h INTEGER NOT NULL DEFAULT 0,
+                reminded_2h  INTEGER NOT NULL DEFAULT 0
             )
         """)
+        sched_cols = _table_columns(c, "schedule")
+        if "reminded_24h" not in sched_cols:
+            c.execute("ALTER TABLE schedule ADD COLUMN reminded_24h INTEGER NOT NULL DEFAULT 0")
+        if "reminded_2h" not in sched_cols:
+            c.execute("ALTER TABLE schedule ADD COLUMN reminded_2h INTEGER NOT NULL DEFAULT 0")
 
         # -- registration_state (survives restarts) ---------------------------
         c.execute("""
@@ -75,17 +86,25 @@ def init_db():
             )
         """)
 
-        # -- Migration: add reminder flags ------------------------------------
-        sched_cols = _table_columns(c, "schedule")
-        if "reminded_24h" not in sched_cols:
-            c.execute("ALTER TABLE schedule ADD COLUMN reminded_24h INTEGER NOT NULL DEFAULT 0")
-        if "reminded_2h" not in sched_cols:
-            c.execute("ALTER TABLE schedule ADD COLUMN reminded_2h INTEGER NOT NULL DEFAULT 0")
+        # -- payments (Stripe tracking) ---------------------------------------
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id     INTEGER NOT NULL,
+                tariff          TEXT    NOT NULL,
+                amount_cents    INTEGER NOT NULL,
+                currency        TEXT    NOT NULL DEFAULT 'EUR',
+                stripe_charge_id TEXT,
+                status          TEXT    NOT NULL DEFAULT 'pending',
+                created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
 
         # -- Indexes ----------------------------------------------------------
-        c.execute("CREATE INDEX IF NOT EXISTS idx_students_tg   ON students(telegram_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_schedule_free ON schedule(student_id, date, time)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_schedule_date ON schedule(date)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_students_tg      ON students(telegram_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_schedule_free    ON schedule(student_id, date, time)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_schedule_date    ON schedule(date)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_payments_tg      ON payments(telegram_id)")
 
         conn.commit()
         log.info("Database initialised / migrated successfully.")
@@ -98,8 +117,7 @@ def init_db():
 def save_reg_state(telegram_id: int, step: str, *,
                    name: str = None, email: str = None, tariff: str = None):
     with _conn() as conn:
-        c = conn.cursor()
-        c.execute("""
+        conn.execute("""
             INSERT INTO registration_state (telegram_id, step, name, email, tariff, updated_at)
             VALUES (?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(telegram_id) DO UPDATE SET
@@ -133,24 +151,39 @@ def clear_reg_state(telegram_id: int):
 #  Student CRUD
 # ---------------------------------------------------------------------------
 
-def add_student(telegram_id: int, name: str, email: str, tariff: str, lessons: int):
+def add_student(telegram_id: int, name: str, email: str, tariff: str,
+                lessons: int, timezone: str = "Europe/Paris"):
+    """First-time registration — sets balance exactly."""
     with _conn() as conn:
         conn.execute("""
-            INSERT INTO students (telegram_id, name, email, tariff, lessons_balance)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO students (telegram_id, name, email, tariff, lessons_balance, timezone)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(telegram_id) DO UPDATE SET
                 name=excluded.name,
                 email=excluded.email,
                 tariff=excluded.tariff,
                 lessons_balance=excluded.lessons_balance,
+                timezone=excluded.timezone,
                 status='active'
-        """, (telegram_id, name, email, tariff, lessons))
+        """, (telegram_id, name, email, tariff, lessons, timezone))
+        conn.commit()
+
+
+def repurchase_tariff(telegram_id: int, tariff: str, extra_lessons: int):
+    """Add lessons to an existing student (repeat purchase)."""
+    with _conn() as conn:
+        conn.execute("""
+            UPDATE students
+            SET tariff=?, lessons_balance = lessons_balance + ?, status='active'
+            WHERE telegram_id=?
+        """, (tariff, extra_lessons, telegram_id))
         conn.commit()
 
 
 def get_student(telegram_id: int) -> Optional[Tuple]:
-    """Return full row or None.  Columns:
-       0:id  1:telegram_id  2:name  3:email  4:tariff  5:lessons_balance  6:status
+    """Columns:
+       0:id  1:telegram_id  2:name  3:email  4:tariff
+       5:lessons_balance  6:status  7:timezone
     """
     with _conn() as conn:
         c = conn.cursor()
@@ -173,7 +206,6 @@ def get_all_students() -> List[Tuple]:
 
 
 def update_lessons_balance(student_id: int, delta: int) -> bool:
-    """Add *delta* lessons (can be negative). Returns False if would go below 0."""
     with _conn() as conn:
         c = conn.cursor()
         c.execute("SELECT lessons_balance FROM students WHERE id=?", (student_id,))
@@ -188,8 +220,13 @@ def update_lessons_balance(student_id: int, delta: int) -> bool:
         return True
 
 
+def update_student_timezone(telegram_id: int, tz: str):
+    with _conn() as conn:
+        conn.execute("UPDATE students SET timezone=? WHERE telegram_id=?", (tz, telegram_id))
+        conn.commit()
+
+
 def toggle_student_status(student_id: int) -> str:
-    """Toggle active/blocked.  Returns new status string."""
     with _conn() as conn:
         c = conn.cursor()
         c.execute("SELECT status FROM students WHERE id=?", (student_id,))
@@ -205,7 +242,6 @@ def toggle_student_status(student_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 def add_slot(teacher: str, date: str, time: str, zoom_link: str) -> int:
-    """Insert a free slot. Returns new row id."""
     with _conn() as conn:
         c = conn.cursor()
         c.execute(
@@ -216,7 +252,6 @@ def add_slot(teacher: str, date: str, time: str, zoom_link: str) -> int:
 
 
 def delete_slot(slot_id: int) -> bool:
-    """Delete a slot (only if not booked). Returns True on success."""
     with _conn() as conn:
         c = conn.cursor()
         c.execute("DELETE FROM schedule WHERE id=? AND student_id IS NULL", (slot_id,))
@@ -225,7 +260,7 @@ def delete_slot(slot_id: int) -> bool:
 
 
 def get_free_slots() -> List[Tuple]:
-    """Columns: 0:id 1:teacher 2:date 3:time 4:zoom_link"""
+    """0:id 1:teacher 2:date 3:time 4:zoom_link"""
     with _conn() as conn:
         c = conn.cursor()
         c.execute(
@@ -244,34 +279,25 @@ def get_free_slots_by_date(date: str) -> List[Tuple]:
 
 
 def book_slot(slot_id: int, student_id: int) -> bool:
-    """Atomically book a slot.  Decrements lessons_balance.
-       Returns True on success, False if slot taken or no balance.
-    """
+    """Atomically book a slot + decrement balance."""
     with _conn() as conn:
         c = conn.cursor()
         try:
             c.execute("BEGIN IMMEDIATE")
-
-            # check balance
             c.execute("SELECT lessons_balance FROM students WHERE id=?", (student_id,))
             row = c.fetchone()
             if not row or row[0] <= 0:
                 conn.rollback()
                 return False
-
-            # try to claim the slot
             c.execute(
                 "UPDATE schedule SET student_id=? WHERE id=? AND student_id IS NULL",
                 (student_id, slot_id))
             if c.rowcount != 1:
                 conn.rollback()
                 return False
-
-            # decrement balance
             c.execute(
                 "UPDATE students SET lessons_balance = lessons_balance - 1 WHERE id=?",
                 (student_id,))
-
             conn.commit()
             return True
         except Exception:
@@ -280,7 +306,7 @@ def book_slot(slot_id: int, student_id: int) -> bool:
 
 
 def cancel_booking(slot_id: int) -> bool:
-    """Admin cancels a booking → frees slot AND returns lesson to student."""
+    """Admin/student cancels a booking → frees slot + returns lesson."""
     with _conn() as conn:
         c = conn.cursor()
         try:
@@ -304,8 +330,32 @@ def cancel_booking(slot_id: int) -> bool:
             raise
 
 
+def cancel_booking_by_student(slot_id: int, student_db_id: int) -> bool:
+    """Student cancels their own booking (ownership check)."""
+    with _conn() as conn:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("SELECT student_id FROM schedule WHERE id=?", (slot_id,))
+            row = c.fetchone()
+            if not row or row[0] != student_db_id:
+                conn.rollback()
+                return False
+            c.execute(
+                "UPDATE schedule SET student_id=NULL, reminded_24h=0, reminded_2h=0 WHERE id=?",
+                (slot_id,))
+            c.execute(
+                "UPDATE students SET lessons_balance = lessons_balance + 1 WHERE id=?",
+                (student_db_id,))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def get_student_slots(student_id: int) -> List[Tuple]:
-    """Columns: 0:id 1:teacher 2:date 3:time 4:zoom_link"""
+    """0:id 1:teacher 2:date 3:time 4:zoom_link"""
     with _conn() as conn:
         c = conn.cursor()
         c.execute(
@@ -322,15 +372,12 @@ def get_slot_by_id(slot_id: int) -> Optional[Tuple]:
 
 
 def get_bookings_by_date(date: str) -> List[Tuple]:
-    """Return booked slots with student name for a given date."""
     with _conn() as conn:
         c = conn.cursor()
         c.execute("""
             SELECT sc.id, s.name, sc.teacher, sc.date, sc.time, sc.zoom_link
-            FROM schedule sc
-            JOIN students s ON sc.student_id = s.id
-            WHERE sc.date = ?
-            ORDER BY sc.time
+            FROM schedule sc JOIN students s ON sc.student_id = s.id
+            WHERE sc.date = ? ORDER BY sc.time
         """, (date,))
         return c.fetchall()
 
@@ -340,47 +387,37 @@ def get_all_bookings() -> List[Tuple]:
         c = conn.cursor()
         c.execute("""
             SELECT sc.id, s.name, sc.teacher, sc.date, sc.time, sc.zoom_link
-            FROM schedule sc
-            JOIN students s ON sc.student_id = s.id
+            FROM schedule sc JOIN students s ON sc.student_id = s.id
             ORDER BY sc.date, sc.time
         """)
         return c.fetchall()
 
 
-def get_all_slots() -> List[Tuple]:
-    """All slots (free + booked) for admin view."""
+def mark_lesson_done(slot_id: int) -> bool:
     with _conn() as conn:
         c = conn.cursor()
-        c.execute("""
-            SELECT sc.id, sc.teacher, sc.date, sc.time, sc.zoom_link,
-                   sc.student_id, COALESCE(s.name, '—')
-            FROM schedule sc
-            LEFT JOIN students s ON sc.student_id = s.id
-            ORDER BY sc.date, sc.time
-        """)
-        return c.fetchall()
+        c.execute("DELETE FROM schedule WHERE id=? AND student_id IS NOT NULL", (slot_id,))
+        conn.commit()
+        return c.rowcount == 1
 
 
 # ---------------------------------------------------------------------------
 #  Reminder helpers
 # ---------------------------------------------------------------------------
 
-def get_upcoming_unreminded(hours: int, flag_col: str) -> List[Tuple]:
-    """Return booked slots within *hours* that haven't been reminded yet.
-       flag_col must be 'reminded_24h' or 'reminded_2h'.
+def get_upcoming_unreminded(flag_col: str) -> List[Tuple]:
+    """0:slot_id 1:teacher 2:date 3:time 4:zoom_link
+       5:student_telegram_id 6:student_name 7:student_timezone
     """
     assert flag_col in ("reminded_24h", "reminded_2h")
     with _conn() as conn:
         c = conn.cursor()
-        # We store date as DD.MM.YYYY and time as HH:MM — build an ISO
-        # string for comparison.
         c.execute(f"""
             SELECT sc.id, sc.teacher, sc.date, sc.time, sc.zoom_link,
-                   s.telegram_id, s.name
+                   s.telegram_id, s.name, s.timezone
             FROM schedule sc
             JOIN students s ON sc.student_id = s.id
-            WHERE sc.{flag_col} = 0
-              AND sc.student_id IS NOT NULL
+            WHERE sc.{flag_col} = 0 AND sc.student_id IS NOT NULL
         """)
         return c.fetchall()
 
@@ -392,13 +429,36 @@ def mark_reminded(slot_id: int, flag_col: str):
         conn.commit()
 
 
-def mark_lesson_done(slot_id: int) -> bool:
-    """Admin marks a lesson as done — removes booking (frees slot row is deleted)."""
+# ---------------------------------------------------------------------------
+#  Payment tracking (Stripe)
+# ---------------------------------------------------------------------------
+
+def create_payment(telegram_id: int, tariff: str, amount_cents: int,
+                   currency: str = "EUR") -> int:
     with _conn() as conn:
         c = conn.cursor()
-        c.execute("DELETE FROM schedule WHERE id=? AND student_id IS NOT NULL", (slot_id,))
+        c.execute("""
+            INSERT INTO payments (telegram_id, tariff, amount_cents, currency)
+            VALUES (?, ?, ?, ?)
+        """, (telegram_id, tariff, amount_cents, currency))
         conn.commit()
-        return c.rowcount == 1
+        return c.lastrowid
+
+
+def complete_payment(payment_id: int, stripe_charge_id: str):
+    with _conn() as conn:
+        conn.execute("""
+            UPDATE payments SET status='completed', stripe_charge_id=?
+            WHERE id=?
+        """, (stripe_charge_id, payment_id))
+        conn.commit()
+
+
+def get_payment(payment_id: int) -> Optional[Tuple]:
+    with _conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM payments WHERE id=?", (payment_id,))
+        return c.fetchone()
 
 
 # ---------------------------------------------------------------------------
