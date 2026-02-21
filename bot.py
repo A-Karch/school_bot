@@ -17,36 +17,6 @@ TARIFFS = {
 }
 
 user_data = {}
-def send_reminders():
-    now = datetime.now()
-    reminder_time = now + timedelta(hours=1)
-    target_date = reminder_time.strftime("%d.%m.%Y")
-    target_time = reminder_time.strftime("%H:%M")
-
-    conn = sqlite3.connect("school.db")
-    c = conn.cursor()
-    c.execute('''SELECT sc.date, sc.time, sc.teacher, sc.zoom_link, s.telegram_id, s.name
-                 FROM schedule sc
-                 JOIN students s ON sc.student_id = s.id
-                 WHERE sc.date = ? AND sc.time = ?''', (target_date, target_time))
-    lessons = c.fetchall()
-    conn.close()
-
-    for lesson in lessons:
-        try:
-            bot.send_message(lesson[4],
-            f"⏰ Напоминание!\n\n"
-            f"Через 1 час у вас урок:\n\n"
-            f"📅 {lesson[0]} в {lesson[1]}\n"
-            f"👩‍🏫 Преподаватель: {lesson[2]}\n"
-            f"🔗 Zoom: {lesson[3]}\n\n"
-            f"Удачного урока, {lesson[5]}! 🎓")
-        except:
-            pass
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(send_reminders, 'interval', minutes=1)
-scheduler.start()
 
 def main_menu(telegram_id):
     student = get_student(telegram_id)
@@ -197,19 +167,41 @@ def process_slot_booking(message):
         return
 
     student = get_student(message.chat.id)
-    book_slot(selected[0], student[0])
+    if not student:
+        bot.send_message(
+            message.chat.id,
+            "Сначала зарегистрируйтесь через 📝 Записаться",
+            reply_markup=main_menu(message.chat.id)
+        )
+        return
+
+    ok = book_slot(selected[0], student[0])
+    if not ok:
+        bot.send_message(
+            message.chat.id,
+            "❌ Этот слот уже заняли. Обновите расписание и выберите другой.",
+            reply_markup=main_menu(message.chat.id)
+        )
+        return
 
     bot.send_message(message.chat.id,
-    f"✅ Вы записаны!\n\n"
-    f"📅 Дата: {selected[2]}\n"
-    f"🕐 Время: {selected[3]}\n"
-    f"👩‍🏫 Преподаватель: {selected[1]}\n"
-    f"🔗 Zoom: {selected[4]}",
-    reply_markup=main_menu(message.chat.id))
+        f"✅ Вы записаны!\n\n"
+        f"📅 Дата: {selected[2]}\n"
+        f"🕐 Время: {selected[3]}\n"
+        f"👩‍🏫 Преподаватель: {selected[1]}\n"
+        f"🔗 Zoom: {selected[4]}",
+        reply_markup=main_menu(message.chat.id))
 
 @bot.message_handler(func=lambda m: m.text == "👤 Личный кабинет")
 def cabinet(message):
     student = get_student(message.chat.id)
+    if not student:
+        bot.send_message(
+            message.chat.id,
+            "Сначала зарегистрируйтесь через 📝 Записаться",
+            reply_markup=main_menu(message.chat.id)
+        )
+        return
     bot.send_message(message.chat.id,
     f"👤 Личный кабинет\n\n"
     f"Имя: {student[2]}\n"

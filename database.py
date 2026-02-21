@@ -57,9 +57,16 @@ def get_free_slots():
 def book_slot(slot_id, student_id):
     conn = sqlite3.connect("school.db")
     c = conn.cursor()
-    c.execute("UPDATE schedule SET student_id=? WHERE id=?", (student_id, slot_id))
+
+    c.execute(
+        "UPDATE schedule SET student_id=? WHERE id=? AND student_id IS NULL",
+        (student_id, slot_id)
+    )
     conn.commit()
+
+    success = (c.rowcount == 1)
     conn.close()
+    return success
 
 def get_student_slots(student_id):
     conn = sqlite3.connect("school.db")
